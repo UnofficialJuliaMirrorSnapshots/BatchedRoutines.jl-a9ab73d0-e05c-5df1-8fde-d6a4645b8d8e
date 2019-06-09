@@ -30,9 +30,25 @@ function batched_scal!(s::AbstractVector{T}, X::AbstractArray{T, 3}) where T
 end
 
 # TODO: use gemm_batch when mkl is available
+"""
+    batched_gemm!(transA, transB, alpha, A, B, beta, C)
 
+Batched gemm!.
+"""
 function batched_gemm! end
+
+"""
+    batched_gemm(transA, transB, alpha, A, B)
+
+Batched gemm.
+"""
 function batched_gemm end
+
+"""
+    batched_gemm(alpha, A, B)
+
+"""
+batched_gemm(alpha::T, A::AbstractArray{T, 3}, B::AbstractArray{T, 3}) where T = batched_gemm('N', 'N', alpha, A, B)
 
 for (gemm, elty) in
         ((:dgemm_,:Float64),
