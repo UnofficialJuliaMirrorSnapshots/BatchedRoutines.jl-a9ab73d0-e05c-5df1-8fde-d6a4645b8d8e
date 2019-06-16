@@ -1,6 +1,7 @@
 export batched_scal, batched_scal!, batched_gemm!, batched_gemm
 
 import LinearAlgebra: BLAS
+import LinearAlgebra.BLAS: libblas, liblapack, @blasfunc, BlasInt
 
 # level 1
 """
@@ -19,15 +20,60 @@ function batched_scal end
 
 batched_scal(s::AbstractVector{T}, X::AbstractArray{T, 3}) where T = batched_scal!(s, copy(X))
 
-function batched_scal!(s::AbstractVector{T}, X::AbstractArray{T, 3}) where T
-    ptrX = Base.unsafe_convert(Ptr{T}, X)
-    chunk_size = size(X, 1) * size(X, 2)
-    @inbounds for k in 1:size(X, 3)
-        BLAS.scal!(chunk_size, s[k], ptrX, 1)
-        ptrX += chunk_size * sizeof(T)
+function batched_scal!(A::AbstractVector{T}, B::AbstractArray{T, 3}) where T
+    @iterate_batch T A, B (1, 2) begin
+        BLAS.scal!(stride(B, 3), A[batch_k], ptrB, 1)
     end
-    X
+    return B
 end
+
+
+for (fname, elty, lib) in ((:dsyr_,:Float64,libblas),
+    (:ssyr_,:Float32,libblas),
+    (:zsyr_,:ComplexF64,liblapack),
+    (:csyr_,:ComplexF32,liblapack))
+    @eval begin
+        function batched_syr!(uplo::AbstractChar, α::$elty, x::AbstractArray{$elty, 2}, A::AbstractArray{$elty, 3})
+            @assert !has_offset_axes(A, x)
+            n = checksquare(A)
+            if length(x) != n
+            throw(DimensionMismatch("A has size ($n,$n), x has length $(length(x))"))
+            end
+
+            @iterate_batch $(elty) (x, A) (1, 2) begin
+                ccall((@blasfunc($fname), $lib), Cvoid,
+                (Ref{UInt8}, Ref{BlasInt}, Ref{$elty}, Ptr{$elty},
+                Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt}),
+                uplo, n, α, ptrx,
+                stride(x, 1), ptrA, max(1,stride(A, 2)))
+            end
+            A
+        end
+    end
+end
+
+
+for (fname, elty, relty) in ((:zher_,:ComplexF64, :Float64),
+                             (:cher_,:ComplexF32, :Float32))
+    @eval begin
+        function batched_her!(uplo::AbstractChar, α::$relty, x::AbstractMatrix{$elty}, A::AbstractArray{$elty, 3})
+            @assert !has_offset_axes(A, x)
+            n = checksquare(A)
+            if length(x) != n
+                throw(DimensionMismatch("A has size ($n,$n), x has length $(length(x))"))
+            end
+            @iterate_batch $(elty) (x, A) (1, 2) begin
+                ccall((@blasfunc($fname), libblas), Cvoid,
+                    (Ref{UInt8}, Ref{BlasInt}, Ref{$relty}, Ptr{$elty},
+                    Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt}),
+                    uplo, n, α, x,
+                    stride(x, 1), A, max(1,stride(A,2)))
+            end
+            A
+        end
+    end
+end
+
 
 # TODO: use gemm_batch when mkl is available
 """
@@ -56,9 +102,13 @@ for (gemm, elty) in
          (:zgemm_,:ComplexF64),
          (:cgemm_,:ComplexF32))
     @eval begin
-        function batched_gemm!(transA::AbstractChar, transB::AbstractChar, alpha::($elty), A::AbstractArray{$elty, 3}, B::AbstractArray{$elty, 3}, beta::($elty), C::AbstractArray{$elty, 3})
+
+        function batched_gemm!(
+            transA::AbstractChar, transB::AbstractChar,
+            alpha::($elty), A::AbstractArray{($elty), 3}, B::AbstractArray{($elty), 3},
+            beta::($elty), C::AbstractArray{($elty), 3})
+        
             @assert !BLAS.has_offset_axes(A, B, C)
-            @assert size(A, 3) == size(B, 3) == size(C, 3) "batch size mismatch"
             m = size(A, transA == 'N' ? 1 : 2)
             ka = size(A, transA == 'N' ? 2 : 1)
             kb = size(B, transB == 'N' ? 1 : 2)
@@ -66,32 +116,21 @@ for (gemm, elty) in
             if ka != kb || m != size(C,1) || n != size(C,2)
                 throw(DimensionMismatch("A has size ($m,$ka), B has size ($kb,$n), C has size $(size(C))"))
             end
-            BLAS.chkstride1(A)
-            BLAS.chkstride1(B)
-            BLAS.chkstride1(C)
 
-            ptrA = Base.unsafe_convert(Ptr{$elty}, A)
-            ptrB = Base.unsafe_convert(Ptr{$elty}, B)
-            ptrC = Base.unsafe_convert(Ptr{$elty}, C)
-
-            for k in 1:size(A, 3)
-                ccall((BLAS.@blasfunc($gemm), BLAS.libblas), Cvoid,
+            @iterate_batch $(elty) A, B, C (2, 2, 2) begin
+            ccall((BLAS.@blasfunc($gemm), BLAS.libblas), Cvoid,
                     (Ref{UInt8}, Ref{UInt8}, Ref{BLAS.BlasInt}, Ref{BLAS.BlasInt},
-                     Ref{BLAS.BlasInt}, Ref{$elty}, Ptr{$elty}, Ref{BLAS.BlasInt},
-                     Ptr{$elty}, Ref{BLAS.BlasInt}, Ref{$elty}, Ptr{$elty},
+                     Ref{BLAS.BlasInt}, Ref{$(elty)}, Ptr{$(elty)}, Ref{BLAS.BlasInt},
+                     Ptr{$(elty)}, Ref{BLAS.BlasInt}, Ref{$(elty)}, Ptr{$(elty)},
                      Ref{BLAS.BlasInt}),
                      transA, transB, m, n,
                      ka, alpha, ptrA, max(1,stride(A,2)),
                      ptrB, max(1,stride(B,2)), beta, ptrC,
-                     max(1,stride(C,2)))
-
-                ptrA += size(A, 1) * size(A, 2) * sizeof($elty)
-                ptrB += size(B, 1) * size(B, 2) * sizeof($elty)
-                ptrC += size(C, 1) * size(C, 2) * sizeof($elty)
+                     max(1,stride(C,2)))    
             end
-
-            C
+            return C
         end
+
         function batched_gemm(transA::AbstractChar, transB::AbstractChar, alpha::($elty), A::AbstractArray{$elty, 3}, B::AbstractArray{$elty, 3})
             batched_gemm!(transA, transB, alpha, A, B, zero($elty), similar(B, $elty, (size(A, transA == 'N' ? 1 : 2), size(B, transB == 'N' ? 2 : 1), size(B, 3))))
         end
